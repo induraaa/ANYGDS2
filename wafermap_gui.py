@@ -106,6 +106,133 @@ def detect_pitch(coords):
     return most_common_diff(xs), most_common_diff(ys)
 
 
+def auto_detect_die_structures(text):
+    """Pick the SREF cell name that forms the largest regular die array."""
+    from collections import defaultdict
+    by_name = defaultdict(list)
+    in_sref = False
+    sname = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line == "SREF":
+            in_sref, sname = True, None
+            continue
+        if not in_sref:
+            continue
+        m = re.match(r"^SNAME\s+(.+)$", line)
+        if m:
+            sname = m.group(1).strip()
+            continue
+        m = re.match(r"^XY\s+(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)", line)
+        if m and sname:
+            by_name[sname].append(
+                (float(m.group(1)) / 1e6, float(m.group(2)) / 1e6, sname))
+            continue
+        if line == "ENDEL":
+            in_sref = False
+
+    best_name = None
+    best_sites = 0
+    for name, pts in by_name.items():
+        if len(pts) < 4:
+            continue
+        px, py = detect_pitch(pts)
+        if not px or not py:
+            continue
+        sites = cluster_die_sites(pts, px, py)
+        if len(sites) > best_sites:
+            best_sites = len(sites)
+            best_name = name
+    return [best_name] if best_name else []
+
+
+def cluster_die_sites(coords, pitch_x, pitch_y):
+    """Merge multiple placements (e.g. sub-cells) into one die per pitch site."""
+    sites = set()
+    for x, y, *_ in coords:
+        sites.add((round(x / pitch_x), round(y / pitch_y)))
+    return sites
+
+
+def build_full_map_grid(coords, pitch_x, pitch_y, diameter, cols, rows,
+                        street_px=3, die_fill=0.88):
+    """
+    SCR08-style ASCII map: '.' outside wafer, '1' die area, 'X' scribe/street.
+    One merged die footprint per pitch site (multiple SREF sub-cells collapse).
+    """
+    if not coords or not pitch_x or not pitch_y:
+        return [], 0
+
+    sites = cluster_die_sites(coords, pitch_x, pitch_y)
+    die_count = len(sites)
+    if not sites:
+        return [], 0
+
+    min_gx = min(g for g, _ in sites)
+    max_gx = max(g for g, _ in sites)
+    min_gy = min(g for _, g in sites)
+    max_gy = max(g for _, g in sites)
+    n_cols_die = max_gx - min_gx + 1
+    n_rows_die = max_gy - min_gy + 1
+
+    pad = street_px * 4
+    usable_w = max(cols - 2 * pad, n_cols_die + 1)
+    usable_h = max(rows - 2 * pad, n_rows_die + 1)
+    slot_x = max(4, usable_w // n_cols_die)
+    slot_y = max(4, usable_h // n_rows_die)
+    die_px_w = max(3, slot_x - street_px)
+    die_px_h = max(3, slot_y - street_px)
+    map_w = pad * 2 + n_cols_die * slot_x
+    map_h = pad * 2 + n_rows_die * slot_y
+
+    grid = [["." for _ in range(map_w)] for _ in range(map_h)]
+
+    for gx, gy in sites:
+        rel_x = gx - min_gx
+        rel_y = max_gy - gy
+        x0 = pad + rel_x * slot_x
+        y0 = pad + rel_y * slot_y
+        for py in range(y0, min(map_h, y0 + die_px_h)):
+            for px in range(x0, min(map_w, x0 + die_px_w)):
+                grid[py][px] = "1"
+
+    centers = [(gx * pitch_x, gy * pitch_y) for gx, gy in sites]
+    max_r = max(math.hypot(x, y) for x, y in centers) + max(pitch_x, pitch_y)
+    wafer_r = max(diameter / 2.0, max_r * 1.08)
+    span_mm = 2.0 * wafer_r
+
+    def cell_center_mm(px, py):
+        x_mm = (px + 0.5) / map_w * span_mm - wafer_r
+        y_mm = wafer_r - (py + 0.5) / map_h * span_mm
+        return x_mm, y_mm
+
+    for py in range(map_h):
+        for px in range(map_w):
+            if grid[py][px] == "1":
+                continue
+            x_mm, y_mm = cell_center_mm(px, py)
+            if math.hypot(x_mm, y_mm) <= wafer_r:
+                grid[py][px] = "X"
+
+    # Fit / center into requested output size (e.g. SCR08 340 x 567)
+    if map_w != cols or map_h != rows:
+        out = [["." for _ in range(cols)] for _ in range(rows)]
+        off_x = max(0, (cols - map_w) // 2)
+        off_y = max(0, (rows - map_h) // 2)
+        for y in range(map_h):
+            oy = y + off_y
+            if oy >= rows:
+                break
+            for x in range(map_w):
+                ox = x + off_x
+                if ox >= cols:
+                    break
+                out[oy][ox] = grid[y][x]
+        grid = out
+
+    return grid, die_count
+
+
 def build_grid(coords, diameter, die_x, die_y, show_edge):
     half = diameter / 2.0
     die_set = set()
@@ -136,60 +263,6 @@ def build_grid(coords, diameter, die_x, die_y, show_edge):
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)))
                 row.append('*' if edge else '.')
         grid.append(row)
-    return grid
-
-
-def _draw_ascii_line(grid, x0, y0, x1, y1, mark):
-    w = len(grid[0]) if grid else 0
-    h = len(grid)
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-    while True:
-        if 0 <= x0 < w and 0 <= y0 < h:
-            grid[y0][x0] = mark
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy
-            x0 += sx
-        if e2 < dx:
-            err += dx
-            y0 += sy
-
-
-def build_layout_ascii_grid(shapes, cols=140, rows=70, mark="#", bg="."):
-    if not shapes:
-        return []
-    xs = [x for pts in shapes for x, _ in pts]
-    ys = [y for pts in shapes for _, y in pts]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span_x = max(max_x - min_x, 1e-9)
-    span_y = max(max_y - min_y, 1e-9)
-
-    grid = [[bg for _ in range(cols)] for _ in range(rows)]
-
-    def to_cell(x, y):
-        gx = int(round((x - min_x) / span_x * (cols - 1)))
-        gy = int(round((y - min_y) / span_y * (rows - 1)))
-        gy = (rows - 1) - gy
-        return gx, gy
-
-    for pts in shapes:
-        if len(pts) == 1:
-            gx, gy = to_cell(pts[0][0], pts[0][1])
-            if 0 <= gx < cols and 0 <= gy < rows:
-                grid[gy][gx] = mark
-            continue
-        mapped = [to_cell(x, y) for x, y in pts]
-        for i in range(len(mapped) - 1):
-            x0, y0 = mapped[i]
-            x1, y1 = mapped[i + 1]
-            _draw_ascii_line(grid, x0, y0, x1, y1, mark)
     return grid
 
 
@@ -432,10 +505,6 @@ class App(tk.Tk):
         self._tbb_convert.pack(side=tk.LEFT, padx=2, pady=2)
         self._tbb_convert.set_state(tk.DISABLED)
 
-        self._tbb_convert = ToolButton(tb, "⚙", "Convert", self._run_convert)
-        self._tbb_convert.pack(side=tk.LEFT, padx=2, pady=2)
-        self._tbb_convert.set_state(tk.DISABLED)
-
         self._tbb_export = ToolButton(tb, "💾", "Export", self._export)
         self._tbb_export.pack(side=tk.LEFT, padx=2, pady=2)
         self._tbb_export.set_state(tk.DISABLED)
@@ -537,13 +606,13 @@ class App(tk.Tk):
             row=4, column=0, columnspan=2, sticky="w", padx=(0,0), pady=(2,2))
 
         label(grp, "Die Structures:").grid(row=5, column=0, sticky="nw", pady=2)
-        self._v_structs = tk.StringVar(value="z5_subdef1,z5_subdef2")
+        self._v_structs = tk.StringVar(value="")
         tk.Entry(grp, textvariable=self._v_structs,
                  bg=WIN_WHITE, fg=WIN_TEXT, relief=tk.SUNKEN,
                  bd=1, font=FONT_MONO, width=18).grid(
             row=5, column=1, sticky="ew", padx=(4, 0), pady=2)
 
-        tk.Label(grp, text="(comma-separated SNAME values)",
+        tk.Label(grp, text="(SNAME filter; empty = auto-detect die cell)",
                  bg=WIN_BG, fg=WIN_TEXT2,
                  font=("MS Sans Serif", 7)).grid(
             row=6, column=0, columnspan=2, sticky="w", padx=2)
@@ -556,7 +625,7 @@ class App(tk.Tk):
                        selectcolor=WIN_WHITE).grid(
             row=7, column=0, columnspan=2, sticky="w", pady=(6, 2))
 
-        self._v_mode = tk.StringVar(value="wafer")
+        self._v_mode = tk.StringVar(value="layout")
         tk.Label(grp, text="Conversion Mode:", bg=WIN_BG, fg=WIN_TEXT, font=FONT).grid(
             row=8, column=0, sticky="w", pady=(8, 2))
         tk.Frame(grp, bg=WIN_BG).grid(row=9, column=0, columnspan=2, sticky="ew")
@@ -564,18 +633,18 @@ class App(tk.Tk):
                        value="wafer", bg=WIN_BG, fg=WIN_TEXT,
                        font=FONT, activebackground=WIN_BG,
                        selectcolor=WIN_WHITE).grid(row=9, column=0, columnspan=2, sticky="w")
-        tk.Radiobutton(grp, text="Generic layout (any GDS)", variable=self._v_mode,
+        tk.Radiobutton(grp, text="Full ASCII map (SCR08-style)", variable=self._v_mode,
                        value="layout", bg=WIN_BG, fg=WIN_TEXT,
                        font=FONT, activebackground=WIN_BG,
                        selectcolor=WIN_WHITE).grid(row=10, column=0, columnspan=2, sticky="w")
 
         label(grp, "ASCII Cols:").grid(row=11, column=0, sticky="w", pady=2)
-        self._v_layout_cols = tk.StringVar(value="140")
+        self._v_layout_cols = tk.StringVar(value="340")
         mk_entry(grp, self._v_layout_cols, width=10).grid(
             row=11, column=1, sticky="w", padx=(4, 0), pady=2)
 
         label(grp, "ASCII Rows:").grid(row=12, column=0, sticky="w", pady=2)
-        self._v_layout_rows = tk.StringVar(value="70")
+        self._v_layout_rows = tk.StringVar(value="567")
         mk_entry(grp, self._v_layout_rows, width=10).grid(
             row=12, column=1, sticky="w", padx=(4, 0), pady=2)
 
@@ -634,10 +703,11 @@ class App(tk.Tk):
         # ── Legend ──
         grp = group_box(inner, "Legend", fill=tk.X, padx=6, pady=(4, 4))
         for sym, col, desc in [
-            ("?", DIE_COL, "Active die"),
-            ("*", EDGE_COL, "Edge / scribe"),
-            (".", EMPTY_COL, "Empty inside wafer"),
-            ("#", WIN_TEXT, "Generic layout geometry"),
+            ("?", DIE_COL, "Active die (wafer mode)"),
+            ("*", EDGE_COL, "Edge / scribe (wafer mode)"),
+            ("1", DIE_COL, "Die (full map)"),
+            ("X", EDGE_COL, "Scribe / street (full map)"),
+            (".", OUT_COL, "Outside wafer"),
         ]:
             row = tk.Frame(grp, bg=WIN_BG)
             row.pack(anchor="w", pady=2)
@@ -828,7 +898,8 @@ class App(tk.Tk):
         sz = fmt_size(p.stat().st_size)
         nm = p.name if len(p.name) <= 30 else "..." + p.name[-27:]
         self._file_lbl.config(text=nm, fg=WIN_TEXT)
-        self._v_out_name.set(p.stem + "_wafermap.txt")
+        suffix = "_fullmap.txt" if self._v_mode.get() == "layout" else "_wafermap.txt"
+        self._v_out_name.set(p.stem + suffix)
         self._btn_convert.config(state=tk.NORMAL)
         self._tbb_convert.set_state(tk.NORMAL)
         self._set_status("Loaded: " + p.name + "  (" + sz + ")")
@@ -861,16 +932,23 @@ class App(tk.Tk):
             if mode == "layout":
                 cols = max(20, int(self._v_layout_cols.get()))
                 rows = max(10, int(self._v_layout_rows.get()))
-                # Generic mode intentionally ignores die-structure filtering.
-                shapes = parse_layout_shapes(self._gds_text, include_snames=None)
-                if not shapes:
+                die_names = structs or auto_detect_die_structures(self._gds_text)
+                coords = parse_gds2(self._gds_text, die_names)
+                if not coords:
                     self.after(0, lambda: self._conv_err(
-                        "No layout XY geometry found.\n\n"
-                        "Try clearing 'Die Structures' or use matching SNAME values."))
+                        "No die placements found.\n\n"
+                        "Set 'Die Structures' to the chip SNAME (e.g. TVSTI309_CHIP)\n"
+                        "or leave empty to auto-detect the die array cell."))
                     return
-                grid = build_layout_ascii_grid(shapes, cols=cols, rows=rows, mark="#", bg=".")
+                pitch_x, pitch_y = detect_pitch(coords)
+                if not pitch_x or not pitch_y:
+                    pitch_x, pitch_y = die_x, die_y
+                grid, item_count = build_full_map_grid(
+                    coords, pitch_x, pitch_y, diameter, cols, rows)
+                if not grid:
+                    self.after(0, lambda: self._conv_err("Could not build ASCII map."))
+                    return
                 out = format_ascii_layout_output(grid, line_mode)
-                item_count = len(shapes)
             else:
                 coords = parse_gds2(self._gds_text, structs)
                 if not coords:
@@ -933,7 +1011,7 @@ class App(tk.Tk):
         cols = len(grid[0])
         px = self._cell_px
 
-        COL = {'?': DIE_COL, '*': EDGE_COL, '.': OUT_COL, '#': WIN_TEXT}
+        COL = {'?': DIE_COL, '*': EDGE_COL, '.': OUT_COL, '1': DIE_COL, 'X': EDGE_COL}
 
         for r in range(rows):
             y1 = r * px
@@ -998,7 +1076,7 @@ class App(tk.Tk):
         cols = len(self._grid[0]) if self._grid else 0
         if 0 <= cx < cols and 0 <= cy < rows:
             ch = self._grid[cy][cx]
-            nm = {'?': 'Die', '*': 'Edge', '.': 'Empty', '#': 'Layout'}.get(ch, '?')
+            nm = {'?': 'Die', '*': 'Edge', '.': 'Outside', '1': 'Die', 'X': 'Scribe'}.get(ch, '?')
             self._coord_lbl.config(
                 text="  Col " + str(cx) + "   Row " + str(cy) + "   [" + nm + "]  ")
 
@@ -1014,8 +1092,8 @@ class App(tk.Tk):
         if not (0 <= cx < cols and 0 <= cy < rows):
             return
 
-        # Cycle: ? -> * -> . -> # -> ?
-        cycle = {'?': '*', '*': '.', '.': '#', '#': '?'}
+        # Cycle: ? -> * -> . -> 1 -> X -> ?
+        cycle = {'?': '*', '*': '.', '.': '1', '1': 'X', 'X': '?'}
         current = self._grid[cy][cx]
         new_val = cycle.get(current, '?')
 
@@ -1041,13 +1119,13 @@ class App(tk.Tk):
                     continue
                 parts = line_s.split('","')
                 if len(parts) < 10:
-                    if set(line_s).issubset(set(".?*#")) and len(line_s) >= 5:
+                    if set(line_s).issubset(set(".?*1X")) and len(line_s) >= 5:
                         header_end = i
                         map_style = "plain"
                         break
                     continue
                 cells = [p.strip().strip('"') for p in parts]
-                if all(c in ('.', '?', '*', '#') for c in cells if c):
+                if all(c in ('.', '?', '*', '1', 'X') for c in cells if c):
                     header_end = i
                     map_style = "quoted"
                     break
@@ -1146,13 +1224,13 @@ class App(tk.Tk):
                     continue
                 parts = line_s.split('","')
                 if len(parts) < 10:
-                    if set(line_s).issubset(set(".?*#")) and len(line_s) >= 5:
+                    if set(line_s).issubset(set(".?*1X")) and len(line_s) >= 5:
                         header_end = i
                         style = "plain"
                         break
                     continue
                 cells = [p.strip().strip('"') for p in parts]
-                if all(c in ('.', '?', '*', '#') for c in cells if c):
+                if all(c in ('.', '?', '*', '1', 'X') for c in cells if c):
                     header_end = i
                     style = "quoted"
                     break
@@ -1169,12 +1247,12 @@ class App(tk.Tk):
                 if not line:
                     continue
                 if style == "plain":
-                    if set(line).issubset(set(".?*#")):
+                    if set(line).issubset(set(".?*1X")):
                         new_grid.append(list(line))
                 else:
                     parts = line.split('","')
                     cells = [p.strip().strip('"') for p in parts]
-                    if cells and all(c in ('.', '?', '*', '#') for c in cells if c):
+                    if cells and all(c in ('.', '?', '*', '1', 'X') for c in cells if c):
                         new_grid.append([c for c in cells if c])
 
             if not new_grid:
@@ -1377,11 +1455,11 @@ class App(tk.Tk):
     # ── About ─────────────────────────────────────────────────────────────────
     def _about(self):
         messagebox.showinfo("About GDS2 Wafer Map Converter",
-                            "GDS2 Wafer Map Converter  v1.1\n\n"
-                            "Converts GDS2 text format files into ASCII\n"
-                            "wafer maps for semiconductor manufacturing.\n\n"
-                            "Output: SINF / KLA compatible format\n"
-                            "Line ending: 22 0d 22 0d 0a\n\n"
+                            "GDS2 Wafer Map Converter  v1.2\n\n"
+                            "Converts GDS2 text into ASCII wafer maps.\n"
+                            "Full map mode: 1=die, X=scribe, .=outside\n"
+                            "(SCR08-style drop-in layout).\n\n"
+                            "Wafer mode: SINF / KLA product format.\n\n"
                             "Requires: Python 3.8+  (no extra packages)")
 
 
