@@ -299,8 +299,8 @@ class App(tk.Tk):
         self._stat = tk.Label(top, text="", bg=BG, fg=MUTED, font=FONT_SM, anchor="w")
         self._stat.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
 
-        body = tk.Frame(self, bg=BG, padx=12, pady=(0, 12))
-        body.pack(fill=tk.BOTH, expand=True)
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
         side = tk.Frame(body, bg=BG, width=200)
         side.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
