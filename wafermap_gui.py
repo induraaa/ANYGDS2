@@ -468,13 +468,32 @@ class App(tk.Tk):
         self._canvas.delete("all")
         rows, cols = len(self._grid), len(self._grid[0])
         px = self._cell_px
+        img_w, img_h = cols * px, rows * px
+
+        img = tk.PhotoImage(width=img_w, height=img_h)
+
+        # Decode hex colours once
+        fill_rgb = tuple(int(FILL_COL.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+        empty_rgb = tuple(int(EMPTY_COL.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+        fill_hex = "#%02x%02x%02x" % fill_rgb
+        empty_hex = "#%02x%02x%02x" % empty_rgb
+
+        # Build all rows as a single Tcl list-of-lists and put in one call.
+        # Each logical row is repeated px times; each cell is px pixels wide.
+        all_rows = []
         for r in range(rows):
-            y1, y2 = r * px, (r + 1) * px
-            for c in range(cols):
-                x1, x2 = c * px, (c + 1) * px
-                fill = FILL_COL if self._grid[r][c] == "1" else EMPTY_COL
-                self._canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=fill)
-        self._canvas.config(scrollregion=(0, 0, cols * px, rows * px))
+            pixel_row = " ".join(
+                fill_hex if self._grid[r][c] == "1" else empty_hex
+                for c in range(cols)
+                for _ in range(px)
+            )
+            row_str = "{" + pixel_row + "}"
+            all_rows.extend([row_str] * px)
+
+        img.put(" ".join(all_rows))
+        self._canvas.create_image(0, 0, anchor="nw", image=img)
+        self._canvas._photo = img  # prevent GC
+        self._canvas.config(scrollregion=(0, 0, img_w, img_h))
 
     def _fit(self):
         if not self._grid:
