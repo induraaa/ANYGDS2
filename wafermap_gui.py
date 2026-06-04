@@ -1,164 +1,229 @@
 #!/usr/bin/env python3
 """
-GDS text → ASCII full wafer map (1=die, X=scribe, .=outside).
+GDS text → ASCII layout (1 = geometry, . = empty).
+Flattens the chosen top cell into its bounding box — no wafer shape or die grid logic.
 Run: python wafermap_gui.py
 """
 
 import re
-import math
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 
+GDS_SCALE = 1e-6  # file units → mm (matches typical KLayout text export)
+XY_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)")
+ELEMENTS = frozenset({"BOUNDARY", "PATH", "BOX", "SREF"})
 
-# ── Converter ─────────────────────────────────────────────────────────────────
 
-def parse_gds2(text, die_structure_names):
-    coords = []
-    in_sref, cur_sname = False, None
-    for line in text.splitlines():
-        line = line.strip()
-        if line == "SREF":
-            in_sref, cur_sname = True, None
+def _xy_pairs(line):
+    return [(float(m.group(1)) * GDS_SCALE, float(m.group(2)) * GDS_SCALE)
+            for m in XY_RE.finditer(line)]
+
+
+def _line_has_coords(line):
+    return bool(XY_RE.search(line))
+
+
+def _flush_poly(cells, cell, in_element, cur_points, sref_name, sref_xy):
+    if in_element in ("BOUNDARY", "PATH", "BOX") and len(cur_points) >= 2:
+        cells[cell]["polys"].append(cur_points)
+    elif in_element == "SREF" and sref_name and sref_xy:
+        cells[cell]["srefs"].append((sref_name, sref_xy[0], sref_xy[1]))
+
+
+def parse_gds_layout(text):
+    """
+    Parse GDSII text into cells: local polygons + child placements (SREF).
+    Returns (cells dict, root_cell name).
+    """
+    cells = {}
+    current_cell = None
+    in_element = None
+    cur_points = []
+    sref_name = None
+    sref_xy = None
+
+    def ensure_cell(name):
+        if name not in cells:
+            cells[name] = {"polys": [], "srefs": []}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        if not in_sref:
+        if line.startswith("STRNAME "):
+            current_cell = line.split(None, 1)[1].strip()
+            ensure_cell(current_cell)
             continue
-        m = re.match(r"^SNAME\s+(.+)$", line)
-        if m:
-            cur_sname = m.group(1)
+        if line in ELEMENTS:
+            if in_element and current_cell:
+                _flush_poly(cells, current_cell, in_element, cur_points, sref_name, sref_xy)
+            in_element = line
+            cur_points = []
+            sref_name = None
+            sref_xy = None
             continue
-        m = re.match(r"^XY\s+(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)", line)
-        if m:
-            if cur_sname and (not die_structure_names or cur_sname in die_structure_names):
-                coords.append((float(m.group(1)) / 1e6, float(m.group(2)) / 1e6, cur_sname))
+        if not in_element or not current_cell:
             continue
-        if line == "ENDEL":
-            in_sref = False
-    return coords
-
-
-def detect_pitch(coords):
-    from collections import Counter
-    xs = sorted(set(x for x, y, _ in coords))
-    ys = sorted(set(y for x, y, _ in coords))
-
-    def step(vals):
-        if len(vals) < 2:
-            return None
-        diffs = [abs(vals[i + 1] - vals[i]) for i in range(len(vals) - 1)]
-        diffs = [d for d in diffs if d > 0]
-        return Counter(diffs).most_common(1)[0][0] if diffs else None
-
-    return step(xs), step(ys)
-
-
-def auto_detect_die_structures(text):
-    from collections import defaultdict
-    by_name = defaultdict(list)
-    in_sref, sname = False, None
-    for line in text.splitlines():
-        line = line.strip()
-        if line == "SREF":
-            in_sref, sname = True, None
-            continue
-        if not in_sref:
-            continue
-        m = re.match(r"^SNAME\s+(.+)$", line)
-        if m:
-            sname = m.group(1).strip()
-            continue
-        m = re.match(r"^XY\s+(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)", line)
-        if m and sname:
-            by_name[sname].append(
-                (float(m.group(1)) / 1e6, float(m.group(2)) / 1e6, sname))
+        if line.startswith("SNAME "):
+            sref_name = line.split(None, 1)[1].strip()
             continue
         if line == "ENDEL":
-            in_sref = False
-
-    best_name, best_sites = None, 0
-    for name, pts in by_name.items():
-        if len(pts) < 4:
+            _flush_poly(cells, current_cell, in_element, cur_points, sref_name, sref_xy)
+            in_element = None
+            cur_points = []
+            sref_name = None
+            sref_xy = None
             continue
-        px, py = detect_pitch(pts)
-        if not px or not py:
-            continue
-        sites = cluster_die_sites(pts, px, py)
-        if len(sites) > best_sites:
-            best_sites, best_name = len(sites), name
-    return [best_name] if best_name else []
+        if in_element in ("BOUNDARY", "PATH", "BOX", "SREF") and _line_has_coords(line):
+            if line.startswith("XY"):
+                line = line[2:].strip()
+            cur_points.extend(_xy_pairs(line))
+            if in_element == "SREF" and cur_points:
+                sref_xy = cur_points[-1]
+
+    if not cells:
+        return {}, None
+
+    root = max(
+        cells.keys(),
+        key=lambda n: len(cells[n]["srefs"]) * 1000 + len(cells[n]["polys"]),
+    )
+    return cells, root
 
 
-def cluster_die_sites(coords, pitch_x, pitch_y):
-    sites = set()
-    for x, y, *_ in coords:
-        sites.add((round(x / pitch_x), round(y / pitch_y)))
-    return sites
+def flatten_cell(cells, name, ox, oy, out_polys):
+    """
+    Layout as drawn in the top cell: local geometry plus each SREF's own
+    polygons (one level). Nested references inside child cells are not expanded.
+    """
+    if name not in cells:
+        out_polys.append([(ox, oy)])
+        return
+    cell = cells[name]
+    for poly in cell["polys"]:
+        out_polys.append([(x + ox, y + oy) for x, y in poly])
+    for child, cx, cy in cell["srefs"]:
+        ref = cells.get(child)
+        if ref and ref["polys"]:
+            for poly in ref["polys"]:
+                out_polys.append([(x + ox + cx, y + oy + cy) for x, y in poly])
+        else:
+            out_polys.append([(ox + cx, oy + cy)])
 
 
-def build_full_map_grid(coords, pitch_x, pitch_y, diameter, cols, rows, street_px=3):
-    if not coords or not pitch_x or not pitch_y:
-        return [], 0
-
-    sites = cluster_die_sites(coords, pitch_x, pitch_y)
-    if not sites:
-        return [], 0
-
-    min_gx = min(g for g, _ in sites)
-    max_gx = max(g for g, _ in sites)
-    min_gy = min(g for _, g in sites)
-    max_gy = max(g for _, g in sites)
-    n_cols_die = max_gx - min_gx + 1
-    n_rows_die = max_gy - min_gy + 1
-
-    pad = street_px * 4
-    usable_w = max(cols - 2 * pad, n_cols_die + 1)
-    usable_h = max(rows - 2 * pad, n_rows_die + 1)
-    slot_x = max(4, usable_w // n_cols_die)
-    slot_y = max(4, usable_h // n_rows_die)
-    die_px_w = max(3, slot_x - street_px)
-    die_px_h = max(3, slot_y - street_px)
-    map_w = pad * 2 + n_cols_die * slot_x
-    map_h = pad * 2 + n_rows_die * slot_y
-
-    grid = [["." for _ in range(map_w)] for _ in range(map_h)]
-
-    for gx, gy in sites:
-        rel_x, rel_y = gx - min_gx, max_gy - gy
-        x0 = pad + rel_x * slot_x
-        y0 = pad + rel_y * slot_y
-        for py in range(y0, min(map_h, y0 + die_px_h)):
-            for px in range(x0, min(map_w, x0 + die_px_w)):
-                grid[py][px] = "1"
-
-    centers = [(gx * pitch_x, gy * pitch_y) for gx, gy in sites]
-    wafer_r = max(diameter / 2.0, max(math.hypot(x, y) for x, y in centers) + max(pitch_x, pitch_y)) * 1.08
-    span = 2.0 * wafer_r
-
-    for py in range(map_h):
-        for px in range(map_w):
-            if grid[py][px] == "1":
+def _fill_polygon(grid, px_pts, cols, rows):
+    """Scanline fill in pixel coordinates."""
+    if len(px_pts) < 3:
+        return
+    ys = [p[1] for p in px_pts]
+    y_min = max(0, min(ys))
+    y_max = min(rows - 1, max(ys))
+    n = len(px_pts)
+    for y in range(y_min, y_max + 1):
+        crossings = []
+        for i in range(n):
+            x1, y1 = px_pts[i]
+            x2, y2 = px_pts[(i + 1) % n]
+            if y1 == y2:
                 continue
-            x_mm = (px + 0.5) / map_w * span - wafer_r
-            y_mm = wafer_r - (py + 0.5) / map_h * span
-            if math.hypot(x_mm, y_mm) <= wafer_r:
-                grid[py][px] = "X"
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                crossings.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+        crossings.sort()
+        for j in range(0, len(crossings) - 1, 2):
+            x_lo = max(0, int(crossings[j]))
+            x_hi = min(cols - 1, int(crossings[j + 1]))
+            for x in range(x_lo, x_hi + 1):
+                grid[y][x] = "1"
 
-    if map_w != cols or map_h != rows:
-        out = [["." for _ in range(cols)] for _ in range(rows)]
-        off_x, off_y = max(0, (cols - map_w) // 2), max(0, (rows - map_h) // 2)
-        for y in range(map_h):
-            oy = y + off_y
-            if oy >= rows:
-                break
-            for x in range(map_w):
-                ox = x + off_x
-                if ox >= cols:
-                    break
-                out[oy][ox] = grid[y][x]
-        grid = out
 
-    return grid, len(sites)
+def _draw_line(grid, x0, y0, x1, y1, cols, rows):
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    while True:
+        if 0 <= x0 < cols and 0 <= y0 < rows:
+            grid[y0][x0] = "1"
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+
+def suggest_grid_size(text, px_per_mm=80, max_dim=2400, root_cell=None):
+    """Pick cols×rows from layout bounding box (no wafer assumptions)."""
+    cells, auto_root = parse_gds_layout(text)
+    if not cells:
+        return 340, 567
+    root = root_cell.strip() if root_cell and root_cell in cells else auto_root
+    polys = []
+    flatten_cell(cells, root, 0.0, 0.0, polys)
+    if not polys:
+        return 340, 567
+    xs = [x for p in polys for x, y in p]
+    ys = [y for p in polys for x, y in p]
+    span_x = max(max(xs) - min(xs), 0.001)
+    span_y = max(max(ys) - min(ys), 0.001)
+    cols = min(max_dim, max(80, round(span_x * px_per_mm)))
+    rows = min(max_dim, max(80, round(span_y * px_per_mm)))
+    return cols, rows
+
+
+def build_layout_grid(text, cols, rows, root_cell=None):
+    """
+    Flatten GDS hierarchy and rasterize into cols×rows ASCII grid.
+    """
+    cells, auto_root = parse_gds_layout(text)
+    if not cells:
+        return [], 0, None
+
+    root = root_cell.strip() if root_cell and root_cell in cells else auto_root
+    polys = []
+    flatten_cell(cells, root, 0.0, 0.0, polys)
+
+    if not polys:
+        return [], 0, root
+
+    xs, ys = [], []
+    for poly in polys:
+        for x, y in poly:
+            xs.append(x)
+            ys.append(y)
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max(max_x - min_x, 1e-12)
+    span_y = max(max_y - min_y, 1e-12)
+
+    grid = [["." for _ in range(cols)] for _ in range(rows)]
+
+    def to_px(x, y):
+        px = int(round((x - min_x) / span_x * (cols - 1)))
+        py = int(round((max_y - y) / span_y * (rows - 1)))
+        return px, py
+
+    for poly in polys:
+        if len(poly) == 1:
+            px, py = to_px(poly[0][0], poly[0][1])
+            if 0 <= px < cols and 0 <= py < rows:
+                grid[py][px] = "1"
+            continue
+        px_pts = [to_px(x, y) for x, y in poly]
+        if len(px_pts) == 2:
+            for px, py in px_pts:
+                if 0 <= px < cols and 0 <= py < rows:
+                    grid[py][px] = "1"
+        elif len(px_pts) >= 3:
+            _fill_polygon(grid, px_pts, cols, rows)
+
+    filled = sum(row.count("1") for row in grid)
+    return grid, filled, root
 
 
 def grid_to_bytes(grid):
@@ -178,10 +243,8 @@ def fmt_size(n):
 BG = "#f8f8f8"
 FG = "#222"
 MUTED = "#666"
-ACCENT = "#2563eb"
-DIE_COL = "#22c55e"
-SCRIBE_COL = "#64748b"
-OUT_COL = "#e2e8f0"
+FILL_COL = "#22c55e"
+EMPTY_COL = "#e2e8f0"
 FONT = ("Segoe UI", 10)
 FONT_SM = ("Segoe UI", 9)
 
@@ -189,7 +252,7 @@ FONT_SM = ("Segoe UI", 9)
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GDS → ASCII Map")
+        self.title("GDS → ASCII Layout")
         self.geometry("960x640")
         self.minsize(720, 480)
         self.configure(bg=BG)
@@ -205,18 +268,17 @@ class App(tk.Tk):
         self._grid = None
         self._out_bytes = None
         self._cell_px = 4
-        self._input_path = None
 
-        self._v_structs = tk.StringVar(value="")
-        self._v_diameter = tk.StringVar(value="147.3")
+        self._v_root = tk.StringVar(value="")
         self._v_cols = tk.StringVar(value="340")
         self._v_rows = tk.StringVar(value="567")
-        self._v_out = tk.StringVar(value="map.txt")
+        self._v_px_mm = tk.StringVar(value="80")
+        self._v_out = tk.StringVar(value="layout.txt")
 
         self._build()
         self.bind("<Control-o>", lambda e: self._open())
         self.bind("<Control-s>", lambda e: self._export())
-        self._status("Open a GDS text file to begin")
+        self._status("Open a GDS text file")
 
     def _build(self):
         top = tk.Frame(self, bg=BG, padx=12, pady=10)
@@ -249,30 +311,29 @@ class App(tk.Tk):
             wraplength=180, justify=tk.LEFT)
         self._file_lbl.pack(anchor="w", pady=(0, 12))
 
-        self._field(side, "Die cell (SNAME)", self._v_structs,
-                    "Empty = auto-detect")
-        self._field(side, "Wafer Ø (mm)", self._v_diameter)
+        self._field(side, "Top cell (STRNAME)", self._v_root,
+                    "Empty = auto (main layout)")
         self._field(side, "Columns", self._v_cols)
         self._field(side, "Rows", self._v_rows)
+        self._field(side, "Detail (px/mm)", self._v_px_mm,
+                    "Used by Auto size")
+        tk.Button(
+            side, text="Auto size", command=self._auto_size, font=FONT_SM,
+            bg="white", fg=FG, relief=tk.GROOVE, bd=1, padx=8, pady=2,
+        ).pack(anchor="w", pady=(0, 8))
         self._field(side, "Export name", self._v_out)
 
-        tk.Label(side, text="1 die  ·  X scribe  ·  . outside",
+        tk.Label(side, text="1 = geometry  ·  . = empty",
                  bg=BG, fg=MUTED, font=FONT_SM).pack(anchor="w", pady=(16, 4))
-
-        for sym, col in (("1", DIE_COL), ("X", SCRIBE_COL), (".", OUT_COL)):
-            row = tk.Frame(side, bg=BG)
-            row.pack(anchor="w", pady=1)
-            tk.Label(row, text=sym, width=2, bg=col, fg="white" if sym != "." else FG,
-                     font=FONT_SM).pack(side=tk.LEFT, padx=(0, 6))
 
         self._info = tk.Label(side, text="", bg=BG, fg=FG, font=FONT_SM,
                               justify=tk.LEFT, wraplength=180)
-        self._info.pack(anchor="w", pady=(12, 0))
+        self._info.pack(anchor="w", pady=(8, 0))
 
         preview = tk.Frame(body, bg="white", relief=tk.SOLID, bd=1)
         preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._canvas = tk.Canvas(preview, bg=OUT_COL, highlightthickness=0)
+        self._canvas = tk.Canvas(preview, bg=EMPTY_COL, highlightthickness=0)
         xsb = tk.Scrollbar(preview, orient=tk.HORIZONTAL, command=self._canvas.xview)
         ysb = tk.Scrollbar(preview, orient=tk.VERTICAL, command=self._canvas.yview)
         self._canvas.configure(xscrollcommand=xsb.set, yscrollcommand=ysb.set)
@@ -282,7 +343,7 @@ class App(tk.Tk):
 
         self._hint = tk.Label(
             preview, text="Open GDS text  →  Convert",
-            bg=OUT_COL, fg=MUTED, font=FONT)
+            bg=EMPTY_COL, fg=MUTED, font=FONT)
         self._hint.place(relx=0.5, rely=0.5, anchor="center")
 
         self._canvas.bind("<Configure>", self._on_resize)
@@ -299,6 +360,21 @@ class App(tk.Tk):
     def _status(self, msg):
         self._stat.config(text=msg)
 
+    def _auto_size(self):
+        if not self._gds_text:
+            messagebox.showwarning("No file", "Open a GDS text file first.")
+            return
+        try:
+            px_mm = float(self._v_px_mm.get())
+            root = self._v_root.get().strip() or None
+            cols, rows = suggest_grid_size(
+                self._gds_text, px_per_mm=px_mm, root_cell=root)
+            self._v_cols.set(str(cols))
+            self._v_rows.set(str(rows))
+            self._status(f"Auto size: {cols}×{rows}")
+        except ValueError:
+            messagebox.showerror("Invalid value", "Detail (px/mm) must be a number.")
+
     def _open(self):
         path = filedialog.askopenfilename(
             title="Open GDS text",
@@ -312,9 +388,16 @@ class App(tk.Tk):
         except OSError as e:
             messagebox.showerror("Open failed", str(e))
             return
-        self._input_path = p
         self._file_lbl.config(text=p.name, fg=FG)
-        self._v_out.set(p.stem + "_map.txt")
+        self._v_out.set(p.stem + "_layout.txt")
+        try:
+            root = self._v_root.get().strip() or None
+            px_mm = float(self._v_px_mm.get())
+            cols, rows = suggest_grid_size(self._gds_text, px_per_mm=px_mm, root_cell=root)
+            self._v_cols.set(str(cols))
+            self._v_rows.set(str(rows))
+        except ValueError:
+            pass
         self._status(f"Loaded {p.name} ({fmt_size(p.stat().st_size)})")
 
     def _convert(self):
@@ -327,43 +410,34 @@ class App(tk.Tk):
 
     def _worker(self):
         try:
-            structs = [s.strip() for s in self._v_structs.get().split(",") if s.strip()]
-            names = structs or auto_detect_die_structures(self._gds_text)
-            coords = parse_gds2(self._gds_text, names)
-            if not coords:
-                self.after(0, lambda: self._fail(
-                    "No die placements found.\n"
-                    "Set die cell SNAME or leave empty for auto-detect."))
-                return
-
-            pitch_x, pitch_y = detect_pitch(coords)
-            diameter = float(self._v_diameter.get())
             cols = max(20, int(self._v_cols.get()))
             rows = max(10, int(self._v_rows.get()))
+            root = self._v_root.get().strip() or None
 
-            grid, n_dies = build_full_map_grid(
-                coords, pitch_x, pitch_y, diameter, cols, rows)
-            if not grid:
-                self.after(0, lambda: self._fail("Could not build map."))
+            grid, filled, used_root = build_layout_grid(
+                self._gds_text, cols, rows, root_cell=root)
+            if not grid or filled == 0:
+                self.after(0, lambda: self._fail(
+                    "No geometry found.\n"
+                    "Check the file is GDSII text with BOUNDARY/PATH/SREF data."))
                 return
 
             out = grid_to_bytes(grid)
-            cell = names[0] if names else "?"
-            pitch = f"{pitch_x:.4f}×{pitch_y:.4f} mm" if pitch_x and pitch_y else "—"
-            self.after(0, lambda: self._done(grid, out, n_dies, cell, pitch))
+            self.after(0, lambda: self._done(grid, out, filled, used_root))
         except ValueError as e:
-            self.after(0, lambda: self._fail(f"Invalid number in settings.\n{e}"))
+            self.after(0, lambda: self._fail(f"Invalid columns/rows.\n{e}"))
         except Exception as e:
             self.after(0, lambda: self._fail(str(e)))
 
-    def _done(self, grid, out, n_dies, cell, pitch):
+    def _done(self, grid, out, filled, root):
         self._grid = grid
         self._out_bytes = out
         rows, cols = len(grid), len(grid[0])
         self._hint.place_forget()
+        pct = 100.0 * filled / (cols * rows) if cols * rows else 0
         self._info.config(
-            text=f"Dies: {n_dies:,}\nSize: {cols}×{rows}\nCell: {cell}\nPitch: {pitch}\nFile: {fmt_size(len(out))}")
-        self._status(f"{n_dies:,} dies · {cols}×{rows} · {fmt_size(len(out))}")
+            text=f"Cell: {root}\nGrid: {cols}×{rows}\nMarked: {filled:,} ({pct:.0f}%)\nFile: {fmt_size(len(out))}")
+        self._status(f"{cols}×{rows} · {pct:.0f}% geometry · {fmt_size(len(out))}")
         self._fit()
 
     def _fail(self, msg):
@@ -375,8 +449,8 @@ class App(tk.Tk):
             messagebox.showwarning("Nothing to save", "Convert a file first.")
             return
         path = filedialog.asksaveasfilename(
-            title="Save ASCII map",
-            initialfile=self._v_out.get() or "map.txt",
+            title="Save ASCII layout",
+            initialfile=self._v_out.get() or "layout.txt",
             defaultextension=".txt",
             filetypes=[("Text", "*.txt"), ("All", "*.*")],
         )
@@ -392,14 +466,13 @@ class App(tk.Tk):
         if not self._grid:
             return
         self._canvas.delete("all")
-        colors = {"1": DIE_COL, "X": SCRIBE_COL, ".": OUT_COL}
         rows, cols = len(self._grid), len(self._grid[0])
         px = self._cell_px
         for r in range(rows):
             y1, y2 = r * px, (r + 1) * px
             for c in range(cols):
                 x1, x2 = c * px, (c + 1) * px
-                fill = colors.get(self._grid[r][c], OUT_COL)
+                fill = FILL_COL if self._grid[r][c] == "1" else EMPTY_COL
                 self._canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=fill)
         self._canvas.config(scrollregion=(0, 0, cols * px, rows * px))
 
